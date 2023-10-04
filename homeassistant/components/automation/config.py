@@ -86,56 +86,52 @@ async def _async_validate_config_item(
     with suppress(ValueError):
         raw_config = dict(config)
 
-    def _log_invalid_automation(
-        err: Exception,
-        automation_name: str,
-        problem: str,
-        config: ConfigType,
-    ) -> None:
-        """Log an error about invalid automation."""
-        if not warn_on_errors:
-            return
+    automation_name = get_automation_name(config)
+    uses_blueprint, raw_blueprint_inputs, config = await handle_blueprint(
+        hass, config, uses_blueprint, raw_blueprint_inputs,
+        automation_name, warn_on_errors, raise_on_errors
+    )
 
-        if uses_blueprint:
-            LOGGER.error(
-                "Blueprint '%s' generated invalid automation with inputs %s: %s",
-                blueprint_inputs.blueprint.name,
-                blueprint_inputs.inputs,
-                humanize_error(config, err) if isinstance(err, vol.Invalid) else err,
-            )
-            return
-
-        LOGGER.error(
-            "%s %s and has been disabled: %s",
-            automation_name,
-            problem,
-            humanize_error(config, err) if isinstance(err, vol.Invalid) else err,
+    try:
+        validated_config = PLATFORM_SCHEMA(config)
+    except vol.Invalid as err:
+        return handle_invalid_configuration(
+            err, automation_name, "could not be validated", config,
+            raise_on_errors, warn_on_errors, raw_blueprint_inputs, raw_config
         )
-        return
 
-    def _minimal_config() -> AutomationConfig:
-        """Try validating id, alias and description."""
-        minimal_config = _MINIMAL_PLATFORM_SCHEMA(config)
-        automation_config = AutomationConfig(minimal_config)
-        automation_config.raw_blueprint_inputs = raw_blueprint_inputs
-        automation_config.raw_config = raw_config
-        automation_config.validation_failed = True
-        return automation_config
+    automation_config = AutomationConfig(validated_config)
+    automation_config.raw_blueprint_inputs = raw_blueprint_inputs
+    automation_config.raw_config = raw_config
 
+    return await validate_config_sections(
+        hass, validated_config, automation_config,
+        automation_name, raise_on_errors
+    )
+
+def get_automation_name(config):
+    """Determine the name of the automation for logging."""
+    automation_name = "Unnamed automation"
+    if isinstance(config, Mapping):
+        if CONF_ALIAS in config:
+            automation_name = f"Automation with alias '{config[CONF_ALIAS]}'"
+        elif CONF_ID in config:
+            automation_name = f"Automation with ID '{config[CONF_ID]}'"
+    return automation_name
+
+async def handle_blueprint(
+    hass, config, uses_blueprint, raw_blueprint_inputs,
+    automation_name, warn_on_errors, raise_on_errors
+):
+    """Handle blueprint-related logic and return updated variables."""
     if blueprint.is_blueprint_instance_config(config):
         uses_blueprint = True
         blueprints = async_get_blueprints(hass)
         try:
             blueprint_inputs = await blueprints.async_inputs_from_config(config)
         except blueprint.BlueprintException as err:
-            if warn_on_errors:
-                LOGGER.error(
-                    "Failed to generate automation from blueprint: %s",
-                    err,
-                )
-            if raise_on_errors:
-                raise
-            return _minimal_config()
+            handle_blueprint_exception(err, warn_on_errors, raise_on_errors)
+            return uses_blueprint, None, config
 
         raw_blueprint_inputs = blueprint_inputs.config_with_inputs
 
@@ -143,50 +139,78 @@ async def _async_validate_config_item(
             config = blueprint_inputs.async_substitute()
             raw_config = dict(config)
         except UndefinedSubstitution as err:
-            if warn_on_errors:
-                LOGGER.error(
-                    "Blueprint '%s' failed to generate automation with inputs %s: %s",
-                    blueprint_inputs.blueprint.name,
-                    blueprint_inputs.inputs,
-                    err,
-                )
-            if raise_on_errors:
-                raise HomeAssistantError(err) from err
-            return _minimal_config()
+            handle_undefined_substitution(err, blueprint_inputs, warn_on_errors, raise_on_errors)
+            return uses_blueprint, raw_blueprint_inputs, config
 
-    automation_name = "Unnamed automation"
-    if isinstance(config, Mapping):
-        if CONF_ALIAS in config:
-            automation_name = f"Automation with alias '{config[CONF_ALIAS]}'"
-        elif CONF_ID in config:
-            automation_name = f"Automation with ID '{config[CONF_ID]}'"
+    return uses_blueprint, raw_blueprint_inputs, config
 
-    try:
-        validated_config = PLATFORM_SCHEMA(config)
-    except vol.Invalid as err:
-        _log_invalid_automation(err, automation_name, "could not be validated", config)
-        if raise_on_errors:
-            raise
-        return _minimal_config()
+def handle_blueprint_exception(err, warn_on_errors, raise_on_errors):
+    """Handle blueprint exception."""
+    if warn_on_errors:
+        LOGGER.error(
+            "Failed to generate automation from blueprint: %s",
+            err,
+        )
+    if raise_on_errors:
+        raise
 
-    automation_config = AutomationConfig(validated_config)
+def handle_undefined_substitution(err, blueprint_inputs, warn_on_errors, raise_on_errors):
+    """Handle undefined substitution exception."""
+    if warn_on_errors:
+        LOGGER.error(
+            "Blueprint '%s' failed to generate automation with inputs %s: %s",
+            blueprint_inputs.blueprint.name,
+            blueprint_inputs.inputs,
+            err,
+        )
+    if raise_on_errors:
+        raise HomeAssistantError(err) from err
+
+def handle_invalid_configuration(
+    err, automation_name, problem, config,
+    raise_on_errors, warn_on_errors, raw_blueprint_inputs, raw_config
+):
+    """Handle invalid configuration and return a minimal config if needed."""
+    log_invalid_automation(err, automation_name, problem, config, warn_on_errors)
+    if raise_on_errors:
+        raise
+    return _minimal_config(raw_blueprint_inputs, raw_config)
+
+def log_invalid_automation(err, automation_name, problem, config, warn_on_errors):
+    """Log an error about invalid automation."""
+    if not warn_on_errors:
+        return
+
+    LOGGER.error(
+        "%s %s and has been disabled: %s",
+        automation_name,
+        problem,
+        humanize_error(config, err) if isinstance(err, vol.Invalid) else err,
+    )
+
+def _minimal_config(raw_blueprint_inputs, raw_config):
+    """Generate a minimal configuration for invalid setups."""
+    minimal_config = _MINIMAL_PLATFORM_SCHEMA(config)
+    automation_config = AutomationConfig(minimal_config)
     automation_config.raw_blueprint_inputs = raw_blueprint_inputs
     automation_config.raw_config = raw_config
+    automation_config.validation_failed = True
+    return automation_config
 
+async def validate_config_sections(
+    hass, validated_config, automation_config,
+    automation_name, raise_on_errors
+):
+    """Validate the configuration sections and return the full config."""
     try:
         automation_config[CONF_TRIGGER] = await async_validate_trigger_config(
             hass, validated_config[CONF_TRIGGER]
         )
-    except (
-        vol.Invalid,
-        HomeAssistantError,
-    ) as err:
-        _log_invalid_automation(
-            err, automation_name, "failed to setup triggers", validated_config
+    except (vol.Invalid, HomeAssistantError) as err:
+        handle_section_error(
+            err, automation_name, "failed to setup triggers", validated_config, 
+            raise_on_errors, automation_config
         )
-        if raise_on_errors:
-            raise
-        automation_config.validation_failed = True
         return automation_config
 
     if CONF_CONDITION in validated_config:
@@ -194,35 +218,37 @@ async def _async_validate_config_item(
             automation_config[CONF_CONDITION] = await async_validate_conditions_config(
                 hass, validated_config[CONF_CONDITION]
             )
-        except (
-            vol.Invalid,
-            HomeAssistantError,
-        ) as err:
-            _log_invalid_automation(
-                err, automation_name, "failed to setup conditions", validated_config
+        except (vol.Invalid, HomeAssistantError) as err:
+            handle_section_error(
+                err, automation_name, "failed to setup conditions", validated_config, 
+                raise_on_errors, automation_config
             )
-            if raise_on_errors:
-                raise
-            automation_config.validation_failed = True
             return automation_config
 
     try:
         automation_config[CONF_ACTION] = await script.async_validate_actions_config(
             hass, validated_config[CONF_ACTION]
         )
-    except (
-        vol.Invalid,
-        HomeAssistantError,
-    ) as err:
-        _log_invalid_automation(
-            err, automation_name, "failed to setup actions", validated_config
+    except (vol.Invalid, HomeAssistantError) as err:
+        handle_section_error(
+            err, automation_name, "failed to setup actions", validated_config, 
+            raise_on_errors, automation_config
         )
-        if raise_on_errors:
-            raise
-        automation_config.validation_failed = True
         return automation_config
 
     return automation_config
+
+def handle_section_error(
+    err, automation_name, problem, validated_config, 
+    raise_on_errors, automation_config
+):
+    """Handle section validation error."""
+    log_invalid_automation(
+        err, automation_name, problem, validated_config, True
+    )
+    if raise_on_errors:
+        raise
+    automation_config.validation_failed = True
 
 
 class AutomationConfig(dict):
