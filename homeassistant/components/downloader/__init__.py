@@ -61,110 +61,97 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
     def download_file(service: ServiceCall) -> None:
         """Start thread to download file specified in the URL."""
 
-        def do_download():
-            """Download the file."""
-            try:
-                url = service.data[ATTR_URL]
+    class FileDownloader:
+        def __init__(self, hass, download_path, service):
+        self.hass = hass
+        self.download_path = download_path
+        self.service = service
+        self.final_path = None
+        self.filename = None
+        self.url = service.data[ATTR_URL]
 
-                subdir = service.data.get(ATTR_SUBDIR)
+    def _get_filename_from_headers(self, headers):
+        if "content-disposition" in headers:
+            match = re.findall(r"filename=(\S+)", headers["content-disposition"])
+            if match:
+                return match[0].strip("'\" ")
+        return None
 
-                filename = service.data.get(ATTR_FILENAME)
+    def _prepare_file_path(self):
+        subdir = self.service.data.get(ATTR_SUBDIR)
+        self.filename = self.service.data.get(ATTR_FILENAME)
+        overwrite = self.service.data.get(ATTR_OVERWRITE)
 
-                overwrite = service.data.get(ATTR_OVERWRITE)
+        if subdir:
+            raise_if_invalid_path(subdir)
 
-                if subdir:
-                    # Check the path
-                    raise_if_invalid_path(subdir)
+        if self.filename is None:
+            self.filename = os.path.basename(self.url).strip()
 
-                final_path = None
+        if not self.filename:
+            self.filename = "ha_download"
 
-                req = requests.get(url, stream=True, timeout=10)
+        raise_if_invalid_filename(self.filename)
 
-                if req.status_code != HTTPStatus.OK:
-                    _LOGGER.warning(
-                        "Downloading '%s' failed, status_code=%d", url, req.status_code
-                    )
-                    hass.bus.fire(
-                        f"{DOMAIN}_{DOWNLOAD_FAILED_EVENT}",
-                        {"url": url, "filename": filename},
-                    )
+        if subdir:
+            subdir_path = os.path.join(self.download_path, subdir)
+            os.makedirs(subdir_path, exist_ok=True)
+            self.final_path = os.path.join(subdir_path, self.filename)
+        else:
+            self.final_path = os.path.join(self.download_path, self.filename)
 
-                else:
-                    if filename is None and "content-disposition" in req.headers:
-                        match = re.findall(
-                            r"filename=(\S+)", req.headers["content-disposition"]
-                        )
+        if not overwrite:
+            path, ext = os.path.splitext(self.final_path)
+            tries = 1
+            while os.path.isfile(self.final_path):
+                tries += 1
+                self.final_path = f"{path}_{tries}.{ext}"
 
-                        if match:
-                            filename = match[0].strip("'\" ")
+    def _download_file(self, req):
+        with open(self.final_path, "wb") as fil:
+            for chunk in req.iter_content(1024):
+                fil.write(chunk)
 
-                    if not filename:
-                        filename = os.path.basename(url).strip()
+    def _fire_event(self, event_name):
+        self.hass.bus.fire(
+            f"{DOMAIN}_{event_name}",
+            {"url": self.url, "filename": self.filename},
+        )
 
-                    if not filename:
-                        filename = "ha_download"
+    def download(self):
+        try:
+            req = requests.get(self.url, stream=True, timeout=10)
 
-                    # Check the filename
-                    raise_if_invalid_filename(filename)
+            if req.status_code != HTTPStatus.OK:
+                _LOGGER.warning("Downloading '%s' failed, status_code=%d", self.url, req.status_code)
+                self._fire_event(DOWNLOAD_FAILED_EVENT)
+                return
 
-                    # Do we want to download to subdir, create if needed
-                    if subdir:
-                        subdir_path = os.path.join(download_path, subdir)
+            if self.filename is None:
+                self.filename = self._get_filename_from_headers(req.headers)
 
-                        # Ensure subdir exist
-                        os.makedirs(subdir_path, exist_ok=True)
+            self._prepare_file_path()
+            self._download_file(req)
+            _LOGGER.debug("Downloading of %s done", self.url)
+            self._fire_event(DOWNLOAD_COMPLETED_EVENT)
 
-                        final_path = os.path.join(subdir_path, filename)
+        except requests.exceptions.RequestException as ex:
+            _LOGGER.exception("Request error occurred: %s", str(ex))
+            self._fire_event(DOWNLOAD_FAILED_EVENT)
+            if self.final_path and os.path.isfile(self.final_path):
+                os.remove(self.final_path)
+        except ValueError:
+            _LOGGER.exception("Invalid value")
+            self._fire_event(DOWNLOAD_FAILED_EVENT)
+            if self.final_path and os.path.isfile(self.final_path):
+                os.remove(self.final_path)
 
-                    else:
-                        final_path = os.path.join(download_path, filename)
+# In the setup function:
+def download_file(service: ServiceCall) -> None:
+    downloader = FileDownloader(hass, download_path, service)
+    threading.Thread(target=downloader.download).start()
 
-                    path, ext = os.path.splitext(final_path)
-
-                    # If file exist append a number.
-                    # We test filename, filename_2..
-                    if not overwrite:
-                        tries = 1
-                        final_path = path + ext
-                        while os.path.isfile(final_path):
-                            tries += 1
-
-                            final_path = f"{path}_{tries}.{ext}"
-
-                    _LOGGER.debug("%s -> %s", url, final_path)
-
-                    with open(final_path, "wb") as fil:
-                        for chunk in req.iter_content(1024):
-                            fil.write(chunk)
-
-                    _LOGGER.debug("Downloading of %s done", url)
-                    hass.bus.fire(
-                        f"{DOMAIN}_{DOWNLOAD_COMPLETED_EVENT}",
-                        {"url": url, "filename": filename},
-                    )
-
-            except requests.exceptions.ConnectionError:
-                _LOGGER.exception("ConnectionError occurred for %s", url)
-                hass.bus.fire(
-                    f"{DOMAIN}_{DOWNLOAD_FAILED_EVENT}",
-                    {"url": url, "filename": filename},
-                )
-
-                # Remove file if we started downloading but failed
-                if final_path and os.path.isfile(final_path):
-                    os.remove(final_path)
-            except ValueError:
-                _LOGGER.exception("Invalid value")
-                hass.bus.fire(
-                    f"{DOMAIN}_{DOWNLOAD_FAILED_EVENT}",
-                    {"url": url, "filename": filename},
-                )
-
-                # Remove file if we started downloading but failed
-                if final_path and os.path.isfile(final_path):
-                    os.remove(final_path)
-
-        threading.Thread(target=do_download).start()
+    threading.Thread(target=do_download).start()
 
     hass.services.register(
         DOMAIN,
