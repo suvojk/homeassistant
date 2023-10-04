@@ -370,50 +370,74 @@ def _local_name_to_index_key(local_name: str) -> str:
     return match_part
 
 
+
+def match_service_uuid(matcher, advertisement_data) -> bool:
+    service_uuid = matcher.get(SERVICE_UUID)
+    return service_uuid in advertisement_data.service_uuids
+
+def match_service_data_uuid(matcher, advertisement_data) -> bool:
+    service_data_uuid = matcher.get(SERVICE_DATA_UUID)
+    return service_data_uuid in advertisement_data.service_data
+
+def match_manufacturer_id(matcher, advertisement_data) -> bool:
+    manufacturer_id = matcher.get(MANUFACTURER_ID)
+    if manufacturer_id not in advertisement_data.manufacturer_data:
+        return False
+
+    manufacturer_data_start = matcher.get(MANUFACTURER_DATA_START)
+    if manufacturer_data_start:
+        manufacturer_data_start_bytes = bytearray(manufacturer_data_start)
+        return any(
+            manufacturer_data.startswith(manufacturer_data_start_bytes)
+            for manufacturer_data in advertisement_data.manufacturer_data.values()
+        )
+    return True
+
+def match_local_name(matcher, advertisement_data, service_info) -> bool:
+    local_name = matcher.get(LOCAL_NAME)
+    device_name = advertisement_data.local_name or service_info.device.name
+    return (
+        bool(device_name)
+        and _memorized_fnmatch(device_name, local_name)
+    )
+
 def ble_device_matches(
     matcher: BluetoothMatcherOptional,
     service_info: BluetoothServiceInfoBleak,
 ) -> bool:
     """Check if a ble device and advertisement_data matches the matcher."""
-    # Don't check address here since all callers already
-    # check the address and we don't want to double check
-    # since it would result in an unreachable reject case.
     if matcher.get(CONNECTABLE, True) and not service_info.connectable:
         return False
 
     advertisement_data = service_info.advertisement
+    
     if (
-        service_uuid := matcher.get(SERVICE_UUID)
-    ) and service_uuid not in advertisement_data.service_uuids:
+        (service_uuid := matcher.get(SERVICE_UUID))
+        and not match_service_uuid(matcher, advertisement_data)
+    ):
         return False
 
     if (
-        service_data_uuid := matcher.get(SERVICE_DATA_UUID)
-    ) and service_data_uuid not in advertisement_data.service_data:
+        (service_data_uuid := matcher.get(SERVICE_DATA_UUID))
+        and not match_service_data_uuid(matcher, advertisement_data)
+    ):
         return False
 
-    if manfacturer_id := matcher.get(MANUFACTURER_ID):
-        if manfacturer_id not in advertisement_data.manufacturer_data:
-            return False
-        if manufacturer_data_start := matcher.get(MANUFACTURER_DATA_START):
-            manufacturer_data_start_bytes = bytearray(manufacturer_data_start)
-            if not any(
-                manufacturer_data.startswith(manufacturer_data_start_bytes)
-                for manufacturer_data in advertisement_data.manufacturer_data.values()
-            ):
-                return False
+    if (
+        (manufacturer_id := matcher.get(MANUFACTURER_ID))
+        and not match_manufacturer_id(matcher, advertisement_data)
+    ):
+        return False
 
-    if (local_name := matcher.get(LOCAL_NAME)) and (
-        (device_name := advertisement_data.local_name or service_info.device.name)
-        is None
-        or not _memorized_fnmatch(
-            device_name,
-            local_name,
-        )
+    if (
+        (local_name := matcher.get(LOCAL_NAME))
+        and not match_local_name(matcher, advertisement_data, service_info)
     ):
         return False
 
     return True
+
+
 
 
 @lru_cache(maxsize=4096, typed=True)
