@@ -212,25 +212,30 @@ async def async_setup_scanner(  # noqa: C901
                 _async_update_ble(service_info, bluetooth.BluetoothChange.ADVERTISEMENT)
 
     cancels = [
+       async def _register_callbacks(hass, update_callback, interval, refresh_callback):
+    cancels = [
         bluetooth.async_register_callback(
             hass,
-            _async_update_ble,
+            update_callback,
             BluetoothCallbackMatcher(
                 connectable=False
             ),  # We will take data from any source
             bluetooth.BluetoothScanningMode.ACTIVE,
         ),
+        async_track_time_interval(hass, refresh_callback, interval),
+    ]
+    return cancels
         async_track_time_interval(hass, _async_refresh_ble, interval),
     ]
 
     @callback
-    def _async_handle_stop(event: Event) -> None:
+    async def _handle_stop(hass, event, cancels):
         """Cancel the callback."""
         for cancel in cancels:
             cancel()
 
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_handle_stop)
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_handle_stop)
 
-    _async_refresh_ble(dt_util.now())
+        _async_refresh_ble(dt_util.now())
 
-    return True
+        return True
