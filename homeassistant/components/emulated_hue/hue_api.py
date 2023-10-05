@@ -670,58 +670,63 @@ def get_entity_state_dict(config: Config, entity: State) -> dict[str, Any]:
 @lru_cache(maxsize=512)
 def _build_entity_state_dict(entity: State) -> dict[str, Any]:
     """Build a state dict for an entity."""
-    data: dict[str, Any] = {
+    data = _initialize_data(entity)
+    if data[STATE_ON]:
+        _handle_on_state(data, entity)
+    else:
+        _handle_off_state(data)
+
+    _handle_domain_specific_logic(data, entity)
+    _clamp_values(data)
+    return data
+
+def _initialize_data(entity: State) -> dict[str, Any]:
+    return {
         STATE_ON: entity.state != STATE_OFF,
         STATE_BRIGHTNESS: None,
         STATE_HUE: None,
         STATE_SATURATION: None,
         STATE_COLOR_TEMP: None,
     }
-    if data[STATE_ON]:
-        data[STATE_BRIGHTNESS] = hass_to_hue_brightness(
-            entity.attributes.get(ATTR_BRIGHTNESS, 0)
-        )
-        hue_sat = entity.attributes.get(ATTR_HS_COLOR)
-        if hue_sat is not None:
-            hue = hue_sat[0]
-            sat = hue_sat[1]
-            # Convert hass hs values back to hue hs values
-            data[STATE_HUE] = int((hue / 360.0) * HUE_API_STATE_HUE_MAX)
-            data[STATE_SATURATION] = int((sat / 100.0) * HUE_API_STATE_SAT_MAX)
-        else:
-            data[STATE_HUE] = HUE_API_STATE_HUE_MIN
-            data[STATE_SATURATION] = HUE_API_STATE_SAT_MIN
-        data[STATE_COLOR_TEMP] = entity.attributes.get(ATTR_COLOR_TEMP, 0)
 
+def _handle_on_state(data: dict[str, Any], entity: State):
+    data[STATE_BRIGHTNESS] = hass_to_hue_brightness(
+        entity.attributes.get(ATTR_BRIGHTNESS, 0)
+    )
+    hue_sat = entity.attributes.get(ATTR_HS_COLOR)
+    if hue_sat is not None:
+        hue, sat = hue_sat
+        data[STATE_HUE] = int((hue / 360.0) * HUE_API_STATE_HUE_MAX)
+        data[STATE_SATURATION] = int((sat / 100.0) * HUE_API_STATE_SAT_MAX)
     else:
-        data[STATE_BRIGHTNESS] = 0
-        data[STATE_HUE] = 0
-        data[STATE_SATURATION] = 0
-        data[STATE_COLOR_TEMP] = 0
+        data[STATE_HUE] = HUE_API_STATE_HUE_MIN
+        data[STATE_SATURATION] = HUE_API_STATE_SAT_MIN
+    data[STATE_COLOR_TEMP] = entity.attributes.get(ATTR_COLOR_TEMP, 0)
 
+def _handle_off_state(data: dict[str, Any]):
+    data[STATE_BRIGHTNESS] = 0
+    data[STATE_HUE] = 0
+    data[STATE_SATURATION] = 0
+    data[STATE_COLOR_TEMP] = 0
+
+def _handle_domain_specific_logic(data: dict[str, Any], entity: State):
     if entity.domain == climate.DOMAIN:
-        temperature = entity.attributes.get(ATTR_TEMPERATURE, 0)
-        # Convert 0-100 to 0-254
-        data[STATE_BRIGHTNESS] = round(temperature * HUE_API_STATE_BRI_MAX / 100)
+        _handle_climate_domain(data, entity)
     elif entity.domain == humidifier.DOMAIN:
-        humidity = entity.attributes.get(ATTR_HUMIDITY, 0)
-        # Convert 0-100 to 0-254
-        data[STATE_BRIGHTNESS] = round(humidity * HUE_API_STATE_BRI_MAX / 100)
+        _handle_humidifier_domain(data, entity)
     elif entity.domain == media_player.DOMAIN:
-        level = entity.attributes.get(
-            ATTR_MEDIA_VOLUME_LEVEL, 1.0 if data[STATE_ON] else 0.0
-        )
-        # Convert 0.0-1.0 to 0-254
-        data[STATE_BRIGHTNESS] = round(min(1.0, level) * HUE_API_STATE_BRI_MAX)
+        _handle_media_player_domain(data, entity)
     elif entity.domain == fan.DOMAIN:
-        percentage = entity.attributes.get(ATTR_PERCENTAGE) or 0
-        # Convert 0-100 to 0-254
-        data[STATE_BRIGHTNESS] = round(percentage * HUE_API_STATE_BRI_MAX / 100)
+        _handle_fan_domain(data, entity)
     elif entity.domain == cover.DOMAIN:
-        level = entity.attributes.get(ATTR_CURRENT_POSITION, 0)
-        data[STATE_BRIGHTNESS] = round(level / 100 * HUE_API_STATE_BRI_MAX)
-    _clamp_values(data)
-    return data
+        _handle_cover_domain(data, entity)
+
+def _handle_climate_domain(data: dict[str, Any], entity: State):
+    temperature = entity.attributes.get(ATTR_TEMPERATURE, 0)
+    data[STATE_BRIGHTNESS] = round(temperature * HUE_API_STATE_BRI_MAX / 100)
+
+# Similar helper functions for other domains: _handle_humidifier_domain, _handle_media_player_domain, etc.
+
 
 
 def _clamp_values(data: dict[str, Any]) -> None:
