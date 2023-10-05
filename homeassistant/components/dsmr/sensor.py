@@ -439,85 +439,57 @@ async def async_setup_entry(
         )
 
     async def connect_and_reconnect() -> None:
-        """Connect to DSMR and keep reconnecting until Home Assistant stops."""
-        stop_listener = None
-        transport = None
-        protocol = None
+    """Connect to DSMR and keep reconnecting until Home Assistant stops."""
+    stop_listener = None
+    transport = None
+    protocol = None
 
-        while hass.state == CoreState.not_running or hass.is_running:
-            # Start DSMR asyncio.Protocol reader
+    while hass.state == CoreState.not_running or hass.is_running:
+        update_entities_telegram({})
+        
+        try:
+            transport, protocol = await hass.loop.create_task(reader_factory())
+            stop_listener = handle_transport_closure(hass, transport)
+            await protocol.wait_closed()
+        except (serial.serialutil.SerialException, OSError):
+            handle_connection_error()
+        except CancelledError:
+            await handle_cancellation(hass, stop_listener, transport, protocol)
+            return
+        
+        # Throttle reconnect attempts
+        await asyncio.sleep(
+            entry.data.get(CONF_RECONNECT_INTERVAL, DEFAULT_RECONNECT_INTERVAL)
+        )
+        update_entities_telegram(None)
 
-            # Reflect connected state in devices state by setting an
-            # empty telegram resulting in `unknown` states
-            update_entities_telegram({})
+async def handle_transport_closure(hass, transport):
+    @callback
+    def close_transport(_event: Event) -> None:
+        if transport:
+            transport.close()
 
-            try:
-                transport, protocol = await hass.loop.create_task(reader_factory())
+    return hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, close_transport)
 
-                if transport:
-                    # Register listener to close transport on HA shutdown
-                    @callback
-                    def close_transport(_event: Event) -> None:
-                        """Close the transport on HA shutdown."""
-                        if not transport:  # noqa: B023
-                            return
-                        transport.close()  # noqa: B023
+def handle_connection_error():
+    LOGGER.exception("Error connecting to DSMR")
+    update_entities_telegram(None)
 
-                    stop_listener = hass.bus.async_listen_once(
-                        EVENT_HOMEASSISTANT_STOP, close_transport
-                    )
+async def handle_cancellation(hass, stop_listener, transport, protocol):
+    update_entities_telegram(None)
+    
+    if stop_listener and (
+        hass.state == CoreState.not_running or hass.is_running
+    ):
+        stop_listener()
 
-                    # Wait for reader to close
-                    await protocol.wait_closed()
+    if transport:
+        transport.close()
 
-                    # Unexpected disconnect
-                    if hass.state == CoreState.not_running or hass.is_running:
-                        stop_listener()
+    
+    if protocol:
+        await protocol.wait_closed()
 
-                transport = None
-                protocol = None
-
-                # Reflect disconnect state in devices state by setting an
-                # None telegram resulting in `unavailable` states
-                update_entities_telegram(None)
-
-                # throttle reconnect attempts
-                await asyncio.sleep(
-                    entry.data.get(CONF_RECONNECT_INTERVAL, DEFAULT_RECONNECT_INTERVAL)
-                )
-
-            except (serial.serialutil.SerialException, OSError):
-                # Log any error while establishing connection and drop to retry
-                # connection wait
-                LOGGER.exception("Error connecting to DSMR")
-                transport = None
-                protocol = None
-
-                # Reflect disconnect state in devices state by setting an
-                # None telegram resulting in `unavailable` states
-                update_entities_telegram(None)
-
-                # throttle reconnect attempts
-                await asyncio.sleep(
-                    entry.data.get(CONF_RECONNECT_INTERVAL, DEFAULT_RECONNECT_INTERVAL)
-                )
-            except CancelledError:
-                # Reflect disconnect state in devices state by setting an
-                # None telegram resulting in `unavailable` states
-                update_entities_telegram(None)
-
-                if stop_listener and (
-                    hass.state == CoreState.not_running or hass.is_running
-                ):
-                    stop_listener()
-
-                if transport:
-                    transport.close()
-
-                if protocol:
-                    await protocol.wait_closed()
-
-                return
 
     # Can't be hass.async_add_job because job runs forever
     task = asyncio.create_task(connect_and_reconnect())
